@@ -81,15 +81,15 @@ func (handlerVectorStore) DeleteAll(context.Context, string, []vectorstore.Query
 }
 func (handlerVectorStore) Close(context.Context, string) error { return nil }
 
-func newBackfillTestHandler(t *testing.T) (*WarpHandler, *fakeSidekiqStore, func()) {
+func newBackfillTestHandler(t *testing.T, extra ...warp.Option) (*WarpHandler, *fakeSidekiqStore, func()) {
 	t.Helper()
-	handler, jobs, _, cleanup := newTopicsTestHandler(t)
+	handler, jobs, _, cleanup := newTopicsTestHandler(t, extra...)
 	return handler, jobs, cleanup
 }
 
 // newTopicsTestHandler is newBackfillTestHandler with the log store the
 // topics live in, for a test that writes them.
-func newTopicsTestHandler(t *testing.T) (*WarpHandler, *fakeSidekiqStore, logstore.LogStore, func()) {
+func newTopicsTestHandler(t *testing.T, extra ...warp.Option) (*WarpHandler, *fakeSidekiqStore, logstore.LogStore, func()) {
 	t.Helper()
 	topics := handlerTopicStore(t)
 	config := &recordingWarpStore{row: &tables.TableWarpConfig{
@@ -98,9 +98,10 @@ func newTopicsTestHandler(t *testing.T) (*WarpHandler, *fakeSidekiqStore, logsto
 	}}
 	jobs := newFakeSidekiqStore()
 	runner := sidekiq.New(jobs, &mockLogger{}, 1, "")
-	service := warp.NewService(nil, warp.WithConfigStore(config), warp.WithLogReader(handlerBackfillReader{topics: topics}), warp.WithVectorStore(handlerVectorStore{}), warp.WithEmbeddingExecutor(func(_ *schemas.BifrostContext, _ *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
+	opts := []warp.Option{warp.WithConfigStore(config), warp.WithLogReader(handlerBackfillReader{topics: topics}), warp.WithVectorStore(handlerVectorStore{}), warp.WithEmbeddingExecutor(func(_ *schemas.BifrostContext, _ *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
 		return &schemas.BifrostEmbeddingResponse{Data: []schemas.EmbeddingData{{Embedding: schemas.EmbeddingStruct{EmbeddingArray: []float64{0, 1}}}}}, nil
-	}))
+	})}
+	service := warp.NewService(nil, append(opts, extra...)...)
 	service.RegisterBackfill(runner)
 	handler := &WarpHandler{service: service, sidekiqRunner: runner, backfillStore: jobs}
 	return handler, jobs, topics, func() { runner.Shutdown(); service.Shutdown() }
@@ -1452,4 +1453,187 @@ func TestWarpChatRefusesAModelThatIsNotExposed(t *testing.T) {
 	require.Equal(t, fasthttp.StatusBadRequest, ctx.Response.StatusCode())
 	require.Contains(t, string(ctx.Response.Body()), "model is not available for warp")
 	require.Empty(t, calls)
+}
+
+// Warp's own store failing at startup is reported as such: the save is refused
+// with the no_vector_store reason and a message naming the setting to fix, not
+// the generic "requires a connected vector store".
+func TestWarpConfigPutWithFailedDedicatedVectorStoreSaysWhy(t *testing.T) {
+	handler := &WarpHandler{service: warp.NewService(nil, warp.WithConfigStore(&recordingWarpStore{}),
+		warp.WithVectorStoreSource(warp.VectorStoreSource{Dedicated: true, Type: "weaviate", Fingerprint: "abc", Failed: true}))}
+	ctx := adminCtx(validWarpConfigJSON)
+	handler.putConfig(ctx)
+	require.Equal(t, fasthttp.StatusServiceUnavailable, ctx.Response.StatusCode())
+	body := string(ctx.Response.Body())
+	require.Contains(t, body, string(schemas.WarpUnavailableNoVectorStore))
+	require.Contains(t, body, "Warp's own vector store (warp.vector_store in config.json) could not be reached")
+
+	getCtx := adminCtx("")
+	handler.getConfig(getCtx)
+	require.Equal(t, fasthttp.StatusOK, getCtx.Response.StatusCode())
+	got := string(getCtx.Response.Body())
+	require.Contains(t, got, `"vector_store_dedicated":true`)
+	require.Contains(t, got, `"vector_store_type":"weaviate"`)
+	require.Contains(t, got, `"vector_store_failed":true`)
+}
+
+// After warp.vector_store is added or moved, a backfill that indexed into the
+// previous store says nothing about the new, empty one: the settings page and
+// the tray show no completed run, so the admin starts a backfill from the
+// existing button. A job into the store in use is still shown.
+func TestWarpBackfillStatusHidesJobFromAnotherVectorStore(t *testing.T) {
+	handler, jobs, cleanup := newBackfillTestHandler(t, warp.WithVectorStoreSource(warp.VectorStoreSource{Dedicated: true, Type: "weaviate", Fingerprint: "abc"}))
+	defer cleanup()
+	current, err := handler.service.BuildBackfillJobMeta(context.Background(), time.Unix(1, 0), time.Unix(2, 0), false)
+	require.NoError(t, err)
+	var meta warp.BackfillJobMeta
+	require.NoError(t, sonic.Unmarshal([]byte(current), &meta))
+	meta.VectorStore = ""
+	sharedStore, err := sonic.Marshal(meta)
+	require.NoError(t, err)
+	jobs.latest = &tables.TableSidekiqJob{ID: "job-shared-store", Kind: warp.BackfillJobKind, Status: tables.SidekiqStatusCompleted, Metadata: string(sharedStore)}
+
+	statusCtx := adminCtx("")
+	handler.backfillStatus(statusCtx)
+	require.Equal(t, fasthttp.StatusOK, statusCtx.Response.StatusCode())
+	require.Contains(t, string(statusCtx.Response.Body()), `"status":"idle"`)
+	require.NotContains(t, string(statusCtx.Response.Body()), "job-shared-store")
+	trayCtx := adminCtx("")
+	handler.logIndexStatus(trayCtx)
+	require.NotContains(t, string(trayCtx.Response.Body()), "job-shared-store")
+
+	jobs.latest.Metadata = current
+	statusCtx = adminCtx("")
+	handler.backfillStatus(statusCtx)
+	require.Contains(t, string(statusCtx.Response.Body()), `"id":"job-shared-store"`)
+	trayCtx = adminCtx("")
+	handler.logIndexStatus(trayCtx)
+	require.Contains(t, string(trayCtx.Response.Body()), `"id":"job-shared-store"`)
+}
+
+// sharedVectorStoreWithWarpIndex is a shared store still holding Warp's index.
+type sharedVectorStoreWithWarpIndex struct {
+	handlerVectorStore
+	deleted []string
+	gone    bool // the namespace was deleted outside Bifrost
+}
+
+func (s *sharedVectorStoreWithWarpIndex) ListNamespaces(context.Context, string) ([]string, error) {
+	if s.gone {
+		return nil, nil
+	}
+	return []string{schemas.WarpDefaultLogVectorStoreNamespace}, nil
+}
+
+func (s *sharedVectorStoreWithWarpIndex) DeleteNamespace(_ context.Context, namespace string) error {
+	s.deleted = append(s.deleted, namespace)
+	return nil
+}
+
+type memoryIndexLedger map[string]string
+
+func (l memoryIndexLedger) GetConfig(_ context.Context, key string) (*tables.TableGovernanceConfig, error) {
+	value, ok := l[key]
+	if !ok {
+		return nil, configstore.ErrNotFound
+	}
+	return &tables.TableGovernanceConfig{Key: key, Value: value}, nil
+}
+
+func (l memoryIndexLedger) UpdateConfig(_ context.Context, config *tables.TableGovernanceConfig, _ ...*gorm.DB) error {
+	l[config.Key] = config.Value
+	return nil
+}
+
+func startedWarpHandler(ledger memoryIndexLedger, shared vectorstore.VectorStore, source warp.VectorStoreSource) *WarpHandler {
+	vectors := shared
+	if source.Dedicated {
+		vectors = handlerVectorStore{}
+	}
+	row := tables.TableWarpConfig{ID: tables.WarpConfigRowID, EmbeddingProvider: "openai", EmbeddingModel: "text-embedding-3-small", EmbeddingDimension: 1536, LogVectorStoreNamespace: schemas.WarpDefaultLogVectorStoreNamespace}
+	handler := &WarpHandler{service: warp.NewService(nil, warp.WithConfigStore(&recordingWarpStore{row: &row}),
+		warp.WithVectorStore(vectors), warp.WithVectorStoreSource(source), warp.WithIndexStoreLedger(ledger, shared))}
+	handler.service.ReconcileIndexStore(context.Background())
+	return handler
+}
+
+func leftBehindCtx(ctx *fasthttp.RequestCtx, id string) *fasthttp.RequestCtx {
+	ctx.SetUserValue("id", id)
+	return ctx
+}
+
+// Moving Warp onto its own store leaves its index in the shared store, which
+// Bifrost still reaches: the settings page lists it and an admin deletes it.
+func TestWarpLeftBehindIndexInTheSharedStoreIsListedAndDeleted(t *testing.T) {
+	ledger := memoryIndexLedger{}
+	shared := &sharedVectorStoreWithWarpIndex{}
+	startedWarpHandler(ledger, shared, warp.VectorStoreSource{})
+	handler := startedWarpHandler(ledger, shared, warp.VectorStoreSource{Dedicated: true, Type: "qdrant", Fingerprint: "abc"})
+
+	getCtx := adminCtx("")
+	handler.getConfig(getCtx)
+	require.Equal(t, fasthttp.StatusOK, getCtx.Response.StatusCode())
+	require.Contains(t, string(getCtx.Response.Body()), `"left_behind_indexes":[`)
+	require.Contains(t, string(getCtx.Response.Body()), `"deletable":true`)
+	left := handler.service.LeftBehindIndexes()
+	require.Len(t, left, 1)
+
+	denied := leftBehindCtx(requestCtx(), left[0].ID)
+	handler.deleteLeftBehindIndex(denied)
+	require.Equal(t, fasthttp.StatusForbidden, denied.Response.StatusCode())
+	require.Empty(t, shared.deleted)
+
+	ctx := leftBehindCtx(adminCtx(""), left[0].ID)
+	handler.deleteLeftBehindIndex(ctx)
+	require.Equal(t, fasthttp.StatusOK, ctx.Response.StatusCode(), string(ctx.Response.Body()))
+	require.JSONEq(t, `{"left_behind_indexes":[]}`, string(ctx.Response.Body()))
+	require.Equal(t, []string{schemas.WarpDefaultLogVectorStoreNamespace}, shared.deleted)
+
+	missing := leftBehindCtx(adminCtx(""), left[0].ID)
+	handler.deleteLeftBehindIndex(missing)
+	require.Equal(t, fasthttp.StatusNotFound, missing.Response.StatusCode())
+}
+
+// Moving off Warp's own store leaves an index Bifrost no longer reaches: it can
+// only be dismissed once the admin has dealt with it.
+func TestWarpLeftBehindIndexInAnUnreachableStoreIsOnlyDismissed(t *testing.T) {
+	ledger := memoryIndexLedger{}
+	shared := &sharedVectorStoreWithWarpIndex{}
+	startedWarpHandler(ledger, shared, warp.VectorStoreSource{Dedicated: true, Type: "qdrant", Fingerprint: "abc"})
+	handler := startedWarpHandler(ledger, shared, warp.VectorStoreSource{})
+	left := handler.service.LeftBehindIndexes()
+	require.Len(t, left, 1)
+	require.False(t, left[0].Deletable)
+
+	ctx := leftBehindCtx(adminCtx(""), left[0].ID)
+	handler.deleteLeftBehindIndex(ctx)
+	require.Equal(t, fasthttp.StatusConflict, ctx.Response.StatusCode())
+	require.Contains(t, string(ctx.Response.Body()), "delete it there by hand")
+	require.Empty(t, shared.deleted)
+
+	// Through the router, at the path enterprise RBAC maps to Warp Update.
+	r := router.New()
+	handler.RegisterRoutes(r)
+	ctx = adminCtx("")
+	ctx.Request.Header.SetMethod("POST")
+	ctx.Request.SetRequestURI("/api/warp/log-index/backfill/left-behind/" + left[0].ID + "/dismiss")
+	r.Handler(ctx)
+	require.Equal(t, fasthttp.StatusOK, ctx.Response.StatusCode(), string(ctx.Response.Body()))
+	require.Empty(t, handler.service.LeftBehindIndexes())
+}
+
+// The shared index deleted outside this replica - by hand, or by another
+// replica's delete - clears its notice on the next settings read.
+func TestWarpConfigReadClearsASharedIndexDeletedElsewhere(t *testing.T) {
+	ledger := memoryIndexLedger{}
+	shared := &sharedVectorStoreWithWarpIndex{}
+	handler := startedWarpHandler(ledger, shared, warp.VectorStoreSource{Dedicated: true, Type: "qdrant", Fingerprint: "abc"})
+	require.Len(t, handler.service.LeftBehindIndexes(), 1)
+
+	shared.gone = true
+	ctx := adminCtx("")
+	handler.getConfig(ctx)
+	require.Equal(t, fasthttp.StatusOK, ctx.Response.StatusCode())
+	require.NotContains(t, string(ctx.Response.Body()), "left_behind_indexes")
+	require.Empty(t, shared.deleted)
 }
