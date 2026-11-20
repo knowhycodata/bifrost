@@ -111,6 +111,7 @@ type ClientConfig struct {
 	DisableDBPingsInHealth                  bool                                  `json:"disable_db_pings_in_health"`
 	LogRetentionDays                        int                                   `json:"log_retention_days" validate:"min=1"`           // Number of days to retain logs (minimum 1 day)
 	VectorRetentionDays                     int                                   `json:"vector_retention_days"`                         // Days to keep vector store entries; 0 = same as logs, capped at log retention
+	VectorMaxSizeMB                         int                                   `json:"vector_max_size_mb"`                            // Size budget in MB for all log-derived vectors together, oldest deleted first; 0 = no cap
 	EnforceAuthOnInference                  bool                                  `json:"enforce_auth_on_inference"`                     // Require auth (VK, API key, or user token) on inference endpoints
 	DualCredentialConflictBehavior          tables.DualCredentialConflictBehavior `json:"dual_credential_conflict_behavior,omitempty"`   // Behavior when both an IDP token and a VK are present on an inference request
 	ExtraFieldsPlacement                    tables.ExtraFieldsPlacement           `json:"extra_fields_placement,omitempty"`              // Where inference responses carry extra_fields: "body" (default) or "headers"
@@ -366,6 +367,10 @@ func (c *ClientConfig) GenerateClientConfigHash() (string, error) {
 	// Only hash non-default value to avoid legacy config hash churn on upgrade.
 	if c.VectorRetentionDays > 0 {
 		hash.Write([]byte("vectorRetentionDays:" + strconv.Itoa(c.VectorRetentionDays)))
+	}
+
+	if c.VectorMaxSizeMB > 0 {
+		hash.Write([]byte("vectorMaxSizeMB:" + strconv.Itoa(c.VectorMaxSizeMB)))
 	}
 
 	if c.VKRotationCooldown > 0 {

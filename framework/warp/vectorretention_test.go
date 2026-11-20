@@ -213,3 +213,20 @@ func TestWarpForgetLogsRecordsNothingWithoutAnEmbeddingModel(t *testing.T) {
 	service.ForgetLogs(context.Background(), []string{"stale"})
 	require.Empty(t, pendingVectorDeletes(t, service))
 }
+
+// Warp offers its log index to the vector budget once it has one to offer:
+// with an embedding model, in the namespace and width it indexes with, and
+// only its own vectors.
+func TestWarpOffersItsLogIndexToTheVectorBudget(t *testing.T) {
+	service, vectors := retentionTestService(t)
+	indexes := service.VectorBudgetIndexes(context.Background())
+	require.Len(t, indexes, 1)
+	require.Same(t, vectors, indexes[0].Store)
+	require.Equal(t, assignTestRow().LogVectorStoreNamespace, indexes[0].Namespace)
+	require.Equal(t, assignTestRow().EmbeddingDimension, indexes[0].Dimension)
+	require.Equal(t, "timestamp", indexes[0].TimestampField)
+
+	never := NewService(nil, WithConfigStore(&recordingStore{}), WithVectorStore(newFakeWarpVectorStore()))
+	t.Cleanup(never.Shutdown)
+	require.Empty(t, never.VectorBudgetIndexes(context.Background()), "nothing indexed without an embedding model")
+}

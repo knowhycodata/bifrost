@@ -186,3 +186,25 @@ func (s *Service) sweepExpiredVectors(ctx context.Context, now time.Time) (int, 
 	})
 	return len(deleted), err
 }
+
+// VectorBudgetIndexes is Warp's log index, for the vector budget, which bounds
+// the space it takes together with the other log-derived indexes and deletes
+// their oldest vectors first. None without a vector store or an embedding
+// model (nothing was indexed), or while the configuration cannot be read.
+func (s *Service) VectorBudgetIndexes(ctx context.Context) []vectorstore.BudgetIndex {
+	s.mu.RLock()
+	vectors := s.vectorStore
+	s.mu.RUnlock()
+	if vectors == nil {
+		return nil
+	}
+	view, err := s.ConfigView(ctx)
+	if err != nil || view.EmbeddingModel == "" {
+		return nil
+	}
+	return []vectorstore.BudgetIndex{{
+		Name: "Warp's log index", Store: vectors, Namespace: view.LogVectorStoreNamespace,
+		Dimension: view.EmbeddingDimension, TimestampField: "timestamp",
+		Filter: []vectorstore.Query{{Field: "warp_log", Operator: vectorstore.QueryOperatorEqual, Value: true}},
+	}}
+}

@@ -3136,6 +3136,13 @@ func TestValidateClientConfig_VectorRetentionDays(t *testing.T) {
 	require.ErrorContains(t, validateClientConfig(&configstore.ClientConfig{VectorRetentionDays: -1}), "vector_retention_days")
 }
 
+func TestValidateClientConfig_VectorMaxSizeMB(t *testing.T) {
+	for _, mb := range []int{0, 1, 2048} {
+		require.NoError(t, validateClientConfig(&configstore.ClientConfig{VectorMaxSizeMB: mb}), "mb=%d", mb)
+	}
+	require.ErrorContains(t, validateClientConfig(&configstore.ClientConfig{VectorMaxSizeMB: -1}), "vector_max_size_mb")
+}
+
 // TestLoadConfig_MCPOpenAPIMaxSpecMBOutOfRangeFailsBoot: an out-of-range
 // mcp_openapi_max_spec_mb in config.json fails startup instead of letting a
 // 1 GiB spec through (or a negative value fall back silently).
